@@ -1,0 +1,621 @@
+{
+  // ============================================================================
+  // FABRIC + SQL HYPERSCALE | AIRFLOW + PIPELINE INGESTION
+  // File: fabric_pipeline_definition.json
+  // ============================================================================
+  //
+  // WHAT IS THIS FILE?
+  //   This is a Fabric Pipeline definition written in JSON format.
+  //   JSON (JavaScript Object Notation) is just a structured way to describe
+  //   things using key-value pairs.
+  //
+  //   This file describes the ENTIRE pipeline blueprint:
+  //     - What parameter it accepts (rebuild_date)
+  //     - What activity it runs (Copy Data)
+  //     - Where it reads from (Azure SQL Hyperscale - the SOURCE)
+  //     - Where it writes to (Fabric Lakehouse Bronze - the SINK)
+  //     - How it connects to both systems (Linked Services)
+  //
+  // HOW THIS FILE FITS IN THE BIGGER PICTURE:
+  //   Remember the two-phase architecture?
+  //
+  //   Phase 1 (fabric-hyperscale-copy-job repo):
+  //     One-time full historical load using Fabric Copy Job.
+  //     Simple, serverless, button-click. No orchestration needed.
+  //     Limitation: cannot handle data drift.
+  //
+  //   Phase 2 (THIS REPO - fabric-airflow-pipeline-ingestion):
+  //     Nightly rebuild of the last 60 days using Airflow + THIS pipeline.
+  //     Airflow loops over 60 dates and calls THIS pipeline once per date.
+  //     THIS pipeline re-copies that date from SQL Hyperscale to Lakehouse.
+  //     Handles data drift perfectly. No Spark. Fully serverless.
+  //
+  // HOW THE PIPELINE WORKS - STEP BY STEP:
+  //
+  //   Imagine you have a filing cabinet (SQL Hyperscale) and a bookshelf
+  //   (Fabric Lakehouse). Every night some folders in the filing cabinet
+  //   get updated with new information (data drift/settling). Your job is
+  //   to make sure the bookshelf always has the latest version of each folder.
+  //
+  //   Here is what happens every night:
+  //
+  //   Step 1: Airflow DAG wakes up and says "I need to rebuild 60 dates"
+  //   Step 2: For each date, Airflow calls the Fabric REST API:
+  //           POST .../items/{pipeline_id}/jobs/instances?jobType=Pipeline
+  //           with rebuild_date = '2026-04-11' (for example)
+  //   Step 3: Fabric receives the call and starts THIS pipeline
+  //   Step 4: The pipeline parameter rebuild_date is set to '2026-04-11'
+  //   Step 5: The Copy Data activity runs this SQL query on SQL Hyperscale:
+  //           SELECT * FROM dbo.fact_shipments
+  //           WHERE shipment_date = '2026-04-11'
+  //   Step 6: The results stream directly into the Fabric Lakehouse
+  //           Bronze Delta table - no Spark, no memory, no notebooks
+  //   Step 7: Write mode is OVERWRITE so that date partition is atomically
+  //           replaced with the latest data from SQL Hyperscale
+  //   Step 8: Pipeline completes. Airflow marks that task green. Moves on.
+  //   Step 9: Repeat for all 60 dates. 
+  //
+  // WHY OVERWRITE INSTEAD OF APPEND? (The Data Drift Solution)
+  //
+  //   Problem: A shipment recorded on April 1st starts as "Pending" (Version 1).
+  //   Over the next 60 days it gets updated: Settling (V2), Settling (V3),
+  //   Settled (V4). The row in SQL Hyperscale keeps CHANGING for 60 days.
+  //
+  //   APPEND:
+  //     Day 1:  Lakehouse has April 1st row as "Pending"
+  //     Day 30: We append the updated row -> NOW WE HAVE DUPLICATES
+  //             Lakehouse has TWO April 1st rows: "Pending" AND "Settling"
+  //             Your analytics are wrong. Which version do you trust?
+  //
+  //   OVERWRITE - what this pipeline does:
+  //     Day 1:  Lakehouse has April 1st rows as "Pending"
+  //     Day 30: We OVERWRITE the entire April 1st partition
+  //             Lakehouse now has ONE April 1st row: "Settling" (latest)
+  //
+  //   Overwrite = atomic partition replacement = data drift solved. 
+  //
+  // WHY NO SPARK?
+  //   The Copy Data activity uses Microsoft's native connectors to talk
+  //   directly between SQL Hyperscale and Fabric Lakehouse. It streams
+  //   the data without loading it into memory.
+  //   Microsoft manages all the infrastructure automatically.
+  //
+  //   
+  //
+  // HOW TO USE THIS FILE:
+  //
+  //   OPTION A - Build manually in Fabric UI (Recommended for beginners):
+  //     1. Go to your Fabric workspace (app.fabric.microsoft.com)
+  //     2. Click New item -> Data Pipeline
+  //     3. Name it: pipeline_shipment_partition_rebuild
+  //     4. Add a Copy Data activity from the toolbar
+  //     5. Configure Source: Azure SQL Database linked service
+  //        Use the SQL query with @pipeline().parameters.rebuild_date
+  //     6. Configure Sink: Fabric Lakehouse, fact_shipments table
+  //        Set write behavior to Overwrite
+  //     7. Add pipeline parameter: rebuild_date (type: string)
+  //     8. Save -> Debug -> test with one date manually
+  //     9. Export the pipeline as JSON to get a version with real IDs
+  //    10. Use that exported JSON as the final version of this file
+  //
+  //   OPTION B - Import JSON directly (Advanced users):
+  //     1. Replace all YOUR-* placeholders below with your real values
+  //        (see PLACEHOLDERS section at the bottom for guidance)
+  //     2. In Fabric workspace click New item -> Data Pipeline
+  //     3. Click the {} code view button in the pipeline editor
+  //     4. Paste the updated JSON
+  //     5. Save and validate
+  //
+  // HOW TO TEST MANUALLY BEFORE CONNECTING AIRFLOW:
+  //   Always test the pipeline standalone first before plugging in Airflow!
+  //   1. Open the pipeline in Fabric UI
+  //   2. Click Debug in the top toolbar
+  //   3. Enter a rebuild_date value e.g. 2026-04-11
+  //   4. Click OK and watch the Copy Data activity run in real time
+  //   5. When green go to your Lakehouse -> Tables -> fact_shipments
+  //   6. Run notebook_validate.py to confirm row counts match SQL Hyperscale
+  //   7. Only THEN connect Airflow to trigger this pipeline automatically
+  //
+  // DISCLAIMER:
+  //   This file is a personal project and is not affiliated with, endorsed
+  //   by, or associated with Microsoft Corporation or any of its subsidiaries.
+  //   All views and code expressed here are my own.
+  //
+  // ============================================================================
+
+  "name": "pipeline_shipment_partition_rebuild",
+
+  // The top-level description of this pipeline.
+  // This appears in the Fabric UI pipeline list so keep it descriptive.
+  "description": "Phase 2 of 2: Nightly rebuild of one shipment date partition from Azure SQL Hyperscale into Fabric Lakehouse Bronze. Triggered by Airflow once per date via REST API. Serverless - no Spark required. See README.md for full two-phase architecture context.",
+
+  "properties": {
+
+    // ==========================================================================
+    // PARAMETERS
+    // ==========================================================================
+    // Parameters are inputs that you pass INTO the pipeline when you trigger it.
+    // Think of them like function arguments in Python:
+    //   def rebuild_partition(rebuild_date):  <- rebuild_date is the parameter
+    //
+    // This pipeline has ONE parameter: rebuild_date
+    //
+    // When Airflow triggers this pipeline it passes the date like this:
+    //   payload = {
+    //     'executionData': {
+    //       'parameters': {
+    //         'rebuild_date': { 'value': '2026-04-11', 'type': 'string' }
+    //       }
+    //     }
+    //   }
+    //
+    // Inside the pipeline you reference it as:
+    //   @pipeline().parameters.rebuild_date
+    //
+    // The defaultValue below is only used when you manually Debug the pipeline
+    // in Fabric UI without specifying a date. Change it to any valid date
+    // that exists in your fact_shipments table for testing.
+    // ==========================================================================
+
+    "parameters": {
+      "rebuild_date": {
+        "type": "string",
+        "defaultValue": "YYYY-MM-DD",
+        "description": "The shipment_date partition to rebuild. Format: YYYY-MM-DD. Passed by the Airflow DAG at runtime for each of the 60 nightly dates. The Copy Data activity filters SQL Hyperscale rows by this date and overwrites that partition in the Lakehouse."
+      }
+    },
+
+    // ==========================================================================
+    // ACTIVITIES
+    // ==========================================================================
+    // Activities are the actual WORK the pipeline does.
+    // Think of activities as steps in a recipe.
+    //
+    // This pipeline has ONE activity: CopyShipmentPartition
+    // It is a Copy Data activity - the serverless workhorse of Fabric Pipelines.
+    //
+    // The Copy Data activity does three things:
+    //   1. Connects to SQL Hyperscale (SOURCE) using a linked service
+    //   2. Runs a SQL query filtered by rebuild_date
+    //   3. Streams the results into the Fabric Lakehouse (SINK)
+    //
+    // No Spark. No memory loading. No notebooks. Microsoft manages everything.
+    // ==========================================================================
+
+    "activities": [
+      {
+        // The internal name of this activity.
+        // Must be unique within the pipeline. No spaces allowed.
+        "name": "CopyShipmentPartition",
+
+        // Copy = Copy Data activity type.
+        // Other types exist (e.g. Notebook, Script, ForEach) but we use
+        // Copy because it is serverless and SQL-native. Perfect for this use case.
+        "type": "Copy",
+
+        "description": "Reads all rows for one shipment_date partition from Azure SQL Hyperscale and atomically overwrites that partition in the Fabric Lakehouse Bronze Delta table. No Spark sessions. No JDBC driver. Microsoft's native connector handles all data movement automatically.",
+
+        "typeProperties": {
+
+          // ====================================================================
+          // SOURCE - Where we READ from (Azure SQL Hyperscale)
+          // ====================================================================
+          // The source is your Azure SQL Hyperscale database.
+          // We use a SQL query to filter rows by the rebuild_date parameter.
+          //
+          // WHAT IS @{pipeline().parameters.rebuild_date}?
+          //   This is a Fabric Pipeline expression.
+          //   @ means "evaluate this as an expression, not plain text"
+          //   pipeline().parameters.rebuild_date means "get the rebuild_date
+          //   parameter that was passed in when this pipeline was triggered"
+          //
+          //   So if Airflow passes rebuild_date = '2026-04-11', the query becomes:
+          //   SELECT ... FROM dbo.fact_shipments WHERE shipment_date = '2026-04-11'
+          //
+          //   This is how one pipeline handles all 60 dates - the query is
+          //   parameterized so the same pipeline works for any date.
+          //
+          // WHY SELECT SPECIFIC COLUMNS INSTEAD OF SELECT *?
+          //   Listing columns explicitly is a best practice because:
+          //   - If someone adds a column to the source table later, the pipeline
+          //     won't accidentally break or pull unexpected data
+          //   - It documents exactly what fields we care about
+          //   - It makes the data contract clear to anyone reading this file
+          //
+          // WHAT IS queryTimeout?
+          //   If the SQL query takes longer than 2 hours something is wrong.
+          //   The timeout cancels it automatically to avoid runaway costs.
+          //   For 60-day partitions of ~33M rows, queries typically run in
+          //   5-15 minutes. 2 hours is a very generous safety net.
+          // ====================================================================
+
+          "source": {
+            "type": "AzureSqlSource",
+
+            // NOTE: This query uses pipeline expression substitution for rebuild_date.
+            // In this repo, Airflow generates rebuild_date via datetime.strftime('%Y-%m-%d').
+            // Production recommendation: validate date format upstream before triggering.
+            "sqlReaderQuery": "SELECT shipment_id, shipment_date, record_version, settlement_status, carrier_code, origin_region, destination_region, estimated_cost, actual_cost, weight_lbs, payload FROM dbo.fact_shipments WHERE shipment_date = '@{pipeline().parameters.rebuild_date}'",
+
+            "queryTimeout": "02:00:00",
+
+            // partitionOption None means we let the SQL query handle all
+            // filtering. We do not need Fabric to split the query into chunks
+            // because we are already targeting one date at a time.
+            "partitionOption": "None"
+          },
+
+          // ====================================================================
+          // SINK - Where we WRITE to (Fabric Lakehouse Bronze)
+          // ====================================================================
+          // The sink is your Fabric Lakehouse fact_shipments Delta table.
+          // Delta is the table format Fabric uses - it supports ACID transactions
+          // which means overwrites are atomic (all-or-nothing, never partial).
+          //
+          // WHAT IS writeBehavior overwrite?
+          //   overwrite means: delete everything for this date partition first,
+          //   then write the new data from SQL Hyperscale.
+          //
+          //   This is the KEY to solving data drift:
+          //     - If a row changed in SQL Hyperscale since last night,
+          //       overwrite replaces it with the latest version
+          //     - No duplicates. No stale data. Always current.
+          //     - The Lakehouse always reflects exactly what SQL Hyperscale has
+          //
+          //   IMPORTANT: overwrite only affects the rows matching rebuild_date.
+          //   Rows from other dates are completely untouched.
+          //   This is partition-level overwrite (atomic partition replace).
+          //
+          // WHAT IS ParquetSink?
+          //   Fabric Lakehouse stores Delta tables as Parquet files under the hood.
+          //   Parquet is a columnar file format optimized for analytics queries.
+          //   You do not need to think about this - Fabric handles it for you.
+          //   Just know that your data lands as a proper Delta table that
+          //   Power BI, notebooks, and SQL analytics can all query directly.
+          // ====================================================================
+
+          "sink": {
+            "type": "ParquetSink",
+
+            "storeSettings": {
+              "type": "LakehouseWriteSettings",
+
+              // overwrite = atomic partition replacement = data drift solved
+              // See the long explanation at the top of this file for details
+              "writeBehavior": "overwrite"
+            },
+
+            "formatSettings": {
+              "type": "ParquetWriteSettings"
+            }
+          },
+
+          // enableStaging = false means data flows DIRECTLY from source to sink.
+          // Staging would route data through a temporary Azure Blob Storage
+          // location first (useful for very large cross-region transfers).
+          // For this POC direct transfer is simpler and sufficient.
+          "enableStaging": false,
+
+          // ====================================================================
+          // COLUMN MAPPING (translator)
+          // ====================================================================
+          // The translator tells the pipeline how to map source columns to
+          // sink columns. TabularTranslator with typeConversion = true means:
+          //   - Match columns by name automatically (shipment_id -> shipment_id)
+          //   - Convert data types if needed (e.g. SQL DECIMAL -> Parquet DOUBLE)
+          //   - allowDataTruncation: if a string is slightly too long, truncate
+          //     it rather than failing the entire pipeline run
+          //
+          // You do not need to define column mappings manually because the
+          // source and sink table have the same schema (same column names).
+          // The auto-mapper handles it.
+          // ====================================================================
+
+          "translator": {
+            "type": "TabularTranslator",
+            "typeConversion": true,
+            "typeConversionSettings": {
+              "allowDataTruncation": false,
+              "treatBooleanAsNumber": false
+            }
+          }
+        },
+
+        // ======================================================================
+        // INPUT DATASET - Defines the source table reference
+        // ======================================================================
+        // The dataset tells the Copy activity WHERE the source data lives.
+        // DS_SQLHyperscale_FactShipments is defined in the datasets section
+        // below. It points to dbo.fact_shipments in your SQL Hyperscale DB.
+        //
+        // We pass rebuild_date as a dataset parameter so the linked service
+        // knows which date to filter on when it opens the connection.
+        // ======================================================================
+
+        "inputs": [
+          {
+            "referenceName": "DS_SQLHyperscale_FactShipments",
+            "type": "DatasetReference",
+            "parameters": {
+              "rebuild_date": {
+                "value": "@pipeline().parameters.rebuild_date",
+                "type": "Expression"
+              }
+            }
+          }
+        ],
+
+        // ======================================================================
+        // OUTPUT DATASET - Defines the sink table reference
+        // ======================================================================
+        // The dataset tells the Copy activity WHERE to write the data.
+        // DS_Lakehouse_FactShipments is defined in the datasets section below.
+        // It points to the fact_shipments Delta table in your Fabric Lakehouse.
+        // ======================================================================
+
+        "outputs": [
+          {
+            "referenceName": "DS_Lakehouse_FactShipments",
+            "type": "DatasetReference"
+          }
+        ],
+
+        // ======================================================================
+        // POLICY - Retry and timeout settings for this activity
+        // ======================================================================
+        // If the Copy Data activity fails (e.g. network blip, Fabric hiccup),
+        // these settings control how Airflow and Fabric handle it.
+        //
+        // timeout:               If the copy takes longer than 2 hours, cancel it
+        // retry:                 Try up to 2 more times if it fails (3 total)
+        // retryIntervalInSeconds: Wait 60 seconds between retry attempts
+        //                        This gives Fabric time to recover from blips
+        //
+        // Note: Airflow ALSO has its own retry settings (retries=2 in the DAG).
+        // Both layers protect you. Pipeline retries handle transient Fabric errors.
+        // Airflow retries handle cases where the pipeline trigger itself failed.
+        // ======================================================================
+
+        "policy": {
+          "timeout": "02:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": true,
+          "secureInput": true
+        }
+      }
+    ]
+  },
+
+  // ============================================================================
+  // DATASETS
+  // ============================================================================
+  // Datasets define the tables or files that the pipeline reads from and
+  // writes to. Think of them as the "addresses" of your data.
+  //
+  // We have TWO datasets:
+  //   DS_SQLHyperscale_FactShipments -> SOURCE (where we read from)
+  //   DS_Lakehouse_FactShipments     -> SINK   (where we write to)
+  //
+  // Each dataset points to a linked service which holds the actual
+  // connection string and credentials. This separation is intentional:
+  //   - Dataset  = WHAT table (schema + table name)
+  //   - Linked Service = HOW to connect (server, auth, credentials)
+  //
+  // This way if your server name changes you only update the linked service
+  // not every dataset that uses it.
+  // ============================================================================
+
+  "datasets": {
+
+    // ==========================================================================
+    // SOURCE DATASET: Azure SQL Hyperscale -> dbo.fact_shipments
+    // ==========================================================================
+    // This dataset represents the fact_shipments table in your SQL Hyperscale
+    // database (Tenant B). The pipeline reads from this table using the
+    // SQL query defined in the Copy Data activity source section above.
+    //
+    // HOW TO SET THIS UP IN FABRIC UI:
+    //   1. In your pipeline click the Copy Data activity
+    //   2. Go to the Source tab
+    //   3. Click New next to Dataset
+    //   4. Choose Azure SQL Database
+    //   5. Choose your linked service (LS_AzureSQLHyperscale)
+    //   6. Set schema: dbo, table: fact_shipments
+    //   7. Switch to Query mode and paste the SQL query from above
+    // ==========================================================================
+
+    "DS_SQLHyperscale_FactShipments": {
+      "description": "SOURCE: dbo.fact_shipments in Azure SQL Hyperscale. The Copy Data activity reads one date partition at a time using a parameterized SQL query. Authentication is via Service Principal (see grant_spn_access.sql). No Spark or JDBC driver required - Fabric uses its native Azure SQL connector.",
+
+      "type": "AzureSqlTable",
+
+      // linkedServiceName points to LS_AzureSQLHyperscale defined below.
+      // That linked service holds your server name, database name, and SPN credentials.
+      // You set it up once and reuse it across as many datasets as you need.
+      "linkedServiceName": "LS_AzureSQLHyperscale",
+
+      "typeProperties": {
+        "schema": "dbo",
+        "table": "fact_shipments"
+      },
+
+      "parameters": {
+        "rebuild_date": {
+          "type": "string",
+          "description": "Passed from the pipeline parameter. Used in the SQL query WHERE clause to filter rows by shipment_date."
+        }
+      }
+    },
+
+    // ==========================================================================
+    // SINK DATASET: Fabric Lakehouse -> fact_shipments Delta table
+    // ==========================================================================
+    // This dataset represents the fact_shipments Delta table in your Fabric
+    // Lakehouse Bronze layer (Tenant A). The pipeline writes to this table
+    // using overwrite mode to atomically replace the date partition.
+    //
+    // HOW TO SET THIS UP IN FABRIC UI:
+    //   1. In your pipeline click the Copy Data activity
+    //   2. Go to the Sink tab
+    //   3. Click New next to Dataset
+    //   4. Choose Microsoft Fabric Lakehouse
+    //   5. Choose your linked service (LS_FabricLakehouse)
+    //   6. Set table: fact_shipments
+    //   7. Set write behavior: Overwrite
+    // ==========================================================================
+
+    "DS_Lakehouse_FactShipments": {
+      "description": "SINK: fact_shipments Delta table in Fabric Lakehouse Bronze layer. Write mode is overwrite so each pipeline run atomically replaces that date partition. Delta format guarantees the write is all-or-nothing - if something fails midway the partition is not corrupted.",
+
+      "type": "LakehouseTable",
+
+      // linkedServiceName points to LS_FabricLakehouse defined below.
+      // That linked service holds your Fabric workspace ID and Lakehouse artifact ID.
+      "linkedServiceName": "LS_FabricLakehouse",
+
+      "typeProperties": {
+        "schema": "dbo",
+        "table": "fact_shipments"
+      }
+    }
+  },
+
+  // ============================================================================
+  // LINKED SERVICES
+  // ============================================================================
+  // Linked services are the CONNECTION STRINGS of the pipeline world.
+  // They hold all the information needed to connect to an external system:
+  //   - Server name / URL
+  //   - Database name
+  //   - Authentication method (Service Principal in our case)
+  //   - Credentials (Client ID, Tenant ID, Secret)
+  //
+  // We have TWO linked services:
+  //   LS_AzureSQLHyperscale -> connects to SQL Hyperscale (SOURCE)
+  //   LS_FabricLakehouse    -> connects to Fabric Lakehouse (SINK)
+  //
+  // SECURITY NOTE:
+  //   Never paste real credentials directly into this file.
+  //   In Fabric UI, credentials are stored securely in the linked service
+  //   configuration and are never exposed in exported JSON.
+  //   All YOUR-* placeholders below must be replaced in the Fabric UI,
+  //   not in this file directly.
+  //
+  // IMPORTANT:
+  //   This file is a public template. Do not import with YOUR-* placeholders.
+  //   Replace all placeholders in Fabric UI before testing or production use.
+  //
+  // HOW TO CREATE LINKED SERVICES IN FABRIC UI:
+  //   1. Go to your Fabric workspace
+  //   2. Click Manage -> Linked Services (or from within the pipeline editor)
+  //   3. Click New and choose the connection type
+  //   4. Fill in your server details and authentication info
+  //   5. Test connection -> Create
+  //   6. Reference the linked service by name in your datasets above
+  // ============================================================================
+
+  "linkedServices": {
+
+    // ==========================================================================
+    // SOURCE LINKED SERVICE: Azure SQL Hyperscale (Tenant B)
+    // ==========================================================================
+    // This is the connection to your SQL Hyperscale database where
+    // dbo.fact_shipments lives with ~200M rows of shipment data.
+    //
+    // Authentication: Service Principal (SPN)
+    //   We use a Service Principal instead of username/password because:
+    //   - SPNs work across tenants (Tenant B source -> Tenant A Fabric)
+    //   - SPNs can be granted minimal permissions (db_datareader only)
+    //   - SPNs do not expire like passwords
+    //   - SPNs are the enterprise standard for service-to-service auth
+    //
+    // The SPN was set up in grant_spn_access.sql. Run that script first
+    // before testing this pipeline or the connection will fail.
+    //
+    // HOW TO FIND YOUR VALUES:
+    //   YOUR-SERVER-NAME:
+    //     Azure Portal -> SQL Server resource -> Overview -> Server name
+    //     Example: myserver.database.windows.net
+    //
+    //   YOUR-DATABASE-NAME:
+    //     Azure Portal -> SQL Database resource -> Overview -> Database name
+    //     Example: hyperscale-poc-db
+    //
+    //   YOUR-SPN-CLIENT-ID:
+    //     Azure Portal -> Microsoft Entra ID -> App registrations
+    //     Find your SPN -> Overview -> Application (client) ID
+    //
+    //   YOUR-TENANT-ID:
+    //     Azure Portal -> Microsoft Entra ID -> Overview -> Tenant ID
+    // ==========================================================================
+
+    "LS_AzureSQLHyperscale": {
+      "description": "Connection to Azure SQL Hyperscale (SOURCE). Uses Service Principal authentication for cross-tenant access. The SPN must have db_datareader role on the database - run grant_spn_access.sql to set this up before testing the pipeline.",
+
+      "type": "AzureSqlDatabase",
+
+      "typeProperties": {
+        // Replace with your actual SQL Hyperscale server name
+        // Example: myserver.database.windows.net
+        "server": "YOUR-SERVER-NAME.database.windows.net",
+
+        // Replace with your actual database name
+        // Example: hyperscale-poc-db
+        "database": "YOUR-DATABASE-NAME",
+
+        // ServicePrincipal = SPN auth (recommended for cross-tenant scenarios)
+        // Alternative: ManagedIdentity (works only same-tenant)
+        "authenticationType": "ServicePrincipal",
+
+        // Replace with the Application (Client) ID of your SPN
+        // Found in: Entra ID -> App registrations -> Your SPN -> Overview
+        "servicePrincipalId": "YOUR-SPN-CLIENT-ID",
+
+        // Replace with your Microsoft Entra Tenant ID
+        // Found in: Entra ID -> Overview -> Tenant ID
+        "tenant": "YOUR-TENANT-ID",
+
+        // ServicePrincipalKey = use a client secret for authentication
+        // The actual secret value is stored securely in Fabric - never in this file
+        "servicePrincipalCredentialType": "ServicePrincipalKey"
+      }
+    },
+
+    // ==========================================================================
+    // SINK LINKED SERVICE: Microsoft Fabric Lakehouse (Tenant A)
+    // ==========================================================================
+    // This is the connection to your Fabric Lakehouse where the rebuilt
+    // partition data lands in the Bronze layer as a Delta table.
+    //
+    // HOW TO FIND YOUR VALUES:
+    //   YOUR-FABRIC-WORKSPACE-ID:
+    //     Go to app.fabric.microsoft.com and open your workspace.
+    //     Look at the browser URL:
+    //     https://app.fabric.microsoft.com/groups/THIS-IS-YOUR-WORKSPACE-ID/...
+    //     Copy the GUID between /groups/ and the next /
+    //
+    //   YOUR-LAKEHOUSE-ARTIFACT-ID:
+    //     Open your Lakehouse in Fabric.
+    //     Look at the browser URL:
+    //     https://app.fabric.microsoft.com/groups/.../lakehouses/THIS-IS-YOUR-LAKEHOUSE-ID
+    //     Copy the GUID at the end of the URL
+    // ==========================================================================
+
+    "LS_FabricLakehouse": {
+      "description": "Connection to Microsoft Fabric Lakehouse (SINK). This is where rebuilt partition data lands in the Bronze layer as a Delta table. Workspace ID and Lakehouse artifact ID are found in the Fabric URL when you open the Lakehouse.",
+
+      "type": "MicrosoftFabricLakehouse",
+
+      "typeProperties": {
+        // Replace with your Fabric workspace ID
+        // Found in Fabric URL: .../groups/YOUR-WORKSPACE-ID/...
+        "workspaceId": "YOUR-FABRIC-WORKSPACE-ID",
+
+        // Replace with your Lakehouse artifact ID
+        // Found in Fabric URL when Lakehouse is open: .../lakehouses/YOUR-LAKEHOUSE-ID
+        "artifactId": "YOUR-LAKEHOUSE-ARTIFACT-ID"
+      }
+    }
+  }
+}

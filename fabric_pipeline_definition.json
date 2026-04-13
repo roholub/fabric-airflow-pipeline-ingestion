@@ -1,0 +1,178 @@
+{
+
+  "name": "pipeline_shipment_partition_rebuild",
+
+  "description": "Phase 2 of 2: Nightly rebuild of one shipment date partition from Azure SQL Hyperscale into Fabric Lakehouse Bronze. Triggered by Airflow once per date via REST API. Serverless - no Spark required. See README.md for full two-phase architecture context.",
+
+  "properties": {
+
+
+    "parameters": {
+      "rebuild_date": {
+        "type": "string",
+        "defaultValue": "YYYY-MM-DD",
+        "description": "The shipment_date partition to rebuild. Format: YYYY-MM-DD. Passed by the Airflow DAG at runtime for each of the 60 nightly dates. The Copy Data activity filters SQL Hyperscale rows by this date and overwrites that partition in the Lakehouse."
+      }
+    },
+
+
+    "activities": [
+      {
+        "name": "CopyShipmentPartition",
+
+        "type": "Copy",
+
+        "description": "Reads all rows for one shipment_date partition from Azure SQL Hyperscale and atomically overwrites that partition in the Fabric Lakehouse Bronze Delta table. No Spark sessions. No JDBC driver. Microsoft's native connector handles all data movement automatically.",
+
+        "typeProperties": {
+
+
+          "source": {
+            "type": "AzureSqlSource",
+
+            "sqlReaderQuery": "SELECT shipment_id, shipment_date, record_version, settlement_status, carrier_code, origin_region, destination_region, estimated_cost, actual_cost, weight_lbs, payload FROM dbo.fact_shipments WHERE shipment_date = '@{pipeline().parameters.rebuild_date}'",
+
+            "queryTimeout": "02:00:00",
+
+            "partitionOption": "None"
+          },
+
+
+          "sink": {
+            "type": "ParquetSink",
+
+            "storeSettings": {
+              "type": "LakehouseWriteSettings",
+
+              "writeBehavior": "overwrite"
+            },
+
+            "formatSettings": {
+              "type": "ParquetWriteSettings"
+            }
+          },
+
+          "enableStaging": false,
+
+
+          "translator": {
+            "type": "TabularTranslator",
+            "typeConversion": true,
+            "typeConversionSettings": {
+              "allowDataTruncation": false,
+              "treatBooleanAsNumber": false
+            }
+          }
+        },
+
+
+        "inputs": [
+          {
+            "referenceName": "DS_SQLHyperscale_FactShipments",
+            "type": "DatasetReference",
+            "parameters": {
+              "rebuild_date": {
+                "value": "@pipeline().parameters.rebuild_date",
+                "type": "Expression"
+              }
+            }
+          }
+        ],
+
+
+        "outputs": [
+          {
+            "referenceName": "DS_Lakehouse_FactShipments",
+            "type": "DatasetReference"
+          }
+        ],
+
+
+        "policy": {
+          "timeout": "02:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": true,
+          "secureInput": true
+        }
+      }
+    ]
+  },
+
+
+  "datasets": {
+
+
+    "DS_SQLHyperscale_FactShipments": {
+      "description": "SOURCE: dbo.fact_shipments in Azure SQL Hyperscale. The Copy Data activity reads one date partition at a time using a parameterized SQL query. Authentication is via Service Principal (see grant_spn_access.sql). No Spark or JDBC driver required - Fabric uses its native Azure SQL connector.",
+
+      "type": "AzureSqlTable",
+
+      "linkedServiceName": "LS_AzureSQLHyperscale",
+
+      "typeProperties": {
+        "schema": "dbo",
+        "table": "fact_shipments"
+      },
+
+      "parameters": {
+        "rebuild_date": {
+          "type": "string",
+          "description": "Passed from the pipeline parameter. Used in the SQL query WHERE clause to filter rows by shipment_date."
+        }
+      }
+    },
+
+
+    "DS_Lakehouse_FactShipments": {
+      "description": "SINK: fact_shipments Delta table in Fabric Lakehouse Bronze layer. Write mode is overwrite so each pipeline run atomically replaces that date partition. Delta format guarantees the write is all-or-nothing - if something fails midway the partition is not corrupted.",
+
+      "type": "LakehouseTable",
+
+      "linkedServiceName": "LS_FabricLakehouse",
+
+      "typeProperties": {
+        "schema": "dbo",
+        "table": "fact_shipments"
+      }
+    }
+  },
+
+
+  "linkedServices": {
+
+
+    "LS_AzureSQLHyperscale": {
+      "description": "Connection to Azure SQL Hyperscale (SOURCE). Uses Service Principal authentication for cross-tenant access. The SPN must have db_datareader role on the database - run grant_spn_access.sql to set this up before testing the pipeline.",
+
+      "type": "AzureSqlDatabase",
+
+      "typeProperties": {
+        "server": "YOUR-SERVER-NAME.database.windows.net",
+
+        "database": "YOUR-DATABASE-NAME",
+
+        "authenticationType": "ServicePrincipal",
+
+        "servicePrincipalId": "YOUR-SPN-CLIENT-ID",
+
+        "tenant": "YOUR-TENANT-ID",
+
+        "servicePrincipalCredentialType": "ServicePrincipalKey"
+      }
+    },
+
+
+    "LS_FabricLakehouse": {
+      "description": "Connection to Microsoft Fabric Lakehouse (SINK). This is where rebuilt partition data lands in the Bronze layer as a Delta table. Workspace ID and Lakehouse artifact ID are found in the Fabric URL when you open the Lakehouse.",
+
+      "type": "MicrosoftFabricLakehouse",
+
+      "typeProperties": {
+        "workspaceId": "YOUR-FABRIC-WORKSPACE-ID",
+
+        "artifactId": "YOUR-LAKEHOUSE-ARTIFACT-ID"
+      }
+    }
+  }
+}
