@@ -1,13 +1,15 @@
 # Microsoft Fabric + Azure SQL Hyperscale
 ## Airflow + Pipeline Ingestion | Nightly Partition Rebuild Pattern
 
-A fully working reference implementation for ingesting large-scale,
+Hi there! 👋🏽 Have you ever had data that won't stop changing after it lands? This is a fully working reference implementation for ingesting large-scale,
 time-partitioned data from Azure SQL Hyperscale into Microsoft Fabric
 Lakehouse using Apache Airflow and Fabric Pipelines, built specifically
 for data that keeps changing after it is first written
-(data drift / data settling).
+(data drift / data settling). 
 
-> **This is Part 3 of a three-part series.**
+This is all built around the idea of a hands-on POC, fast to run, but production notes are included.
+
+> **This is Part 3 of a three-part repo series.**
 > Each repo solves the same core problem in a different way.
 > Read the full story below to help pick the right approach.
 
@@ -37,7 +39,7 @@ What it cannot do:
 	SQL Hyperscale, the Copy Job does not pick it up because watermark logic
 	only looks forward, not backward.
 
-> Think of it as a **moving truck**. Great for the big move,
+> I love using analogies! Think of data drift as a **moving truck**. Great for the big move,
 > but it does not come back every night to rearrange the furniture.
 
 ---
@@ -62,8 +64,7 @@ What to keep in mind:
 - 60 dates = 60 Spark sessions per nightly rebuild
 - More powerful than needed for pure data copy use cases
 
-> Think of it as **hiring 60 specialized workers**. Each is excellent,
-> but you are paying for 60 crews when one conveyor belt may be enough.
+> Here is another analogy💡: Think of this airflow solution as **hiring 60 specialized workers**. Each is excellent, but you are paying for 60 crews when one conveyor belt may be enough.
 
 ---
 
@@ -84,7 +85,7 @@ What makes this one different:
 - Handles data drift cleanly, same outcome as notebook approach
 - Parallelism friendly, multiple partitions can run simultaneously
 
-> Think of it as **a smart conveyor belt with traffic control**.
+> Ready for yet another analogy? 😁Think of this solution as **a smart conveyor belt with traffic control**.
 > Airflow controls what runs and when, pipeline moves data automatically,
 > and no heavy machinery is needed.
 
@@ -190,6 +191,32 @@ Microsoft manages all compute.
 
 ---
 
+## Who Does What
+
+Here is how every component works:
+
+- **Fabric Copy Job (Standalone) = The Bootstrap Loader**
+  Runs the one-time historical load from SQL Hyperscale into the Lakehouse.
+  It is great for initial bulk ingest, but it does not orchestrate nightly partition rebuilds.
+
+- **Airflow DAG = The Manager / Scheduler**
+  Handles orchestration and timing only. It decides which dates run and when,
+  then triggers the pipeline. It never reads, writes, or deletes business data.
+
+- **Fabric Pipeline = The Worker**
+  Executes the Copy Data task for one partition date at a time using overwrite.
+  Overwrite here is atomic: delete + write happen as one operation, never partial.
+
+- **notebook_validate.py = The Auditor**
+  Read-only verification step after ingestion. It compares source and sink counts
+  and reports pass/fail. It never writes or deletes anything.
+
+Atomic overwrite:
+If a write fails midway, the old partition data is still there.
+You never end up with a half-written table or zero rows for that partition.
+
+---
+
 ## How the Three Repos Work Together
 
 ```
@@ -212,8 +239,6 @@ Microsoft manages all compute.
 | fact_shipments Delta table, Bronze layer, always current      |
 +---------------------------------------------------------------+
 ```
-
----
 
 ## Repository Contents
 
@@ -258,29 +283,7 @@ No need to regenerate data or rebuild infra.
 
 ---
 
-## Who Does What
-
-This pattern works because each component has one clear job.
-
-- **Airflow DAG = The Manager / Scheduler**
-  Handles orchestration and timing only. It decides which dates run and when,
-  then triggers the pipeline. It never reads, writes, or deletes business data.
-
-- **Fabric Pipeline = The Worker**
-  Executes the Copy Data task for one partition date at a time using overwrite.
-  Overwrite here is atomic: delete + write happen as one operation, never partial.
-
-- **notebook_validate.py = The Auditor**
-  Read-only verification step after ingestion. It compares source and sink counts
-  and reports pass/fail. It never writes or deletes anything.
-
-Atomic overwrite:
-If a write fails midway, the old partition data is still there.
-You never end up with a half-written table or zero rows for that partition.
-
----
-
-## Quick Start – Correct Order (Order Matters)
+## Quick Start – (Order Matters)
 
 Run setup in this exact sequence:
 1. SQL data generation
