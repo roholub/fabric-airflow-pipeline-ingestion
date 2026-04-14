@@ -8,28 +8,8 @@
 #   It is the ORCHESTRATOR in the nightly rebuild pipeline.
 #   Think of it as the manager - it decides WHEN and WHAT to run,
 #   while a Fabric Pipeline (Copy Data activity) does the actual
-#   data movement. No Spark. No notebooks. Fully serverless.
+#   data movement (the worker). No Spark. No notebooks. Fully serverless.
 #
-# HOW THIS REPO FITS INTO THE BIGGER PICTURE:
-#   This is Phase 2 of a two-phase architecture:
-#
-#   Phase 1 (fabric-hyperscale-copy-job):
-#     - One-time full historical load
-#     - Uses Fabric Copy Job (serverless, button-click simple)
-#     - Copies ALL rows from SQL Hyperscale to Fabric Lakehouse
-#     - Best for: initial data migration, append-only incremental loads
-#     - Limitation: cannot handle data drift (settled/updated rows)
-#
-#   Phase 2 (THIS REPO - fabric-airflow-pipeline-ingestion):
-#     - Nightly rebuild of the last 60 days (the "drift zone")
-#     - Uses Airflow to orchestrate Fabric Pipelines (serverless)
-#     - Each pipeline run targets ONE partition date and re-copies it
-#     - Best for: data drift, data settling, partition-level accuracy
-#     - Cost: ~$0.01-0.05 per full 60-partition run (no Spark!)
-#
-#   Together they give you:
-#     "Copy Job gets your history into Fabric in one shot.
-#      Airflow + Pipelines keeps it fresh every night."
 #
 # WHAT IS APACHE AIRFLOW?
 #   Apache Airflow is an open-source platform for scheduling and
@@ -56,17 +36,18 @@
 #     2. Run a parameterized SQL query: WHERE shipment_date = @rebuild_date
 #     3. Write the results directly into Fabric Lakehouse Bronze layer
 #        using Delta Lake replaceWhere (atomic partition replacement)
+#   
 #   The pipeline is fully serverless - Microsoft manages all compute.
-#   Bill's SQL team can open the pipeline in Fabric UI and read every step.
+#   A SQL team can open the pipeline in the Fabric UI and read every step.
 #
 # WHY PIPELINES INSTEAD OF NOTEBOOKS?
-#   Notebooks (Repo 2):  60 dates x 1 Spark session each = 60 Spark startups
+#   Notebooks:           60 dates x 1 Spark session each = 60 Spark startups
 #                        Each startup: 2-5 min warmup + Fabric capacity cost
-#                        Total: potentially 5-8 hours and $15-40+ per run
+#                        Total: potentially 5-8 hours
 #
 #   Pipelines (THIS):    60 dates x 1 serverless pipeline each = 0 Spark
-#                        No warmup, no Spark cost, SQL-native connectors
-#                        Total: ~1-3 hours and ~$0.01-0.05 per run
+#                        No warmup, SQL-native connectors
+#                        Total: ~1-3 hours
 #
 # HOW IT TRIGGERS THE PIPELINE:
 #   Airflow calls the Fabric REST API once per date:
@@ -100,12 +81,6 @@
 #   3. In the Airflow UI toggle the DAG to ON (blue toggle)
 #   4. The DAG will now run automatically every night at 3am UTC
 #
-# COST WARNING:
-#   Running this DAG nightly consumes minimal Fabric capacity.
-#   Pipelines are serverless - no Spark sessions at all.
-#   SCHEDULE is set to None during POC to avoid unexpected costs.
-#   Enable the nightly schedule only when ready for production.
-#   Recommended: set a $50 Azure budget alert on your resource group.
 #
 # PREREQUISITES:
 #   - This file uploaded to Fabric Airflow dags folder
